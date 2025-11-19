@@ -45,29 +45,29 @@ class SocialNetworkMicroservices:
         'nginx-thrift': MicroserviceSpec(
             name='nginx-thrift',
             dependencies=['home-timeline', 'user-timeline', 'compose-post'],
-            scale_min=2, scale_max=10,
-            execution_time_ms=4.0,        # Routing è veloce
-            workers=20,                   # Nginx gestisce tantissime connessioni
-            degradation_factor=0.01,      # Quasi zero degradazione (è event-loop based)
+            scale_min=1, scale_max=10,   # ← Parte da 1
+            execution_time_ms=2.0,       # ← Molto veloce
+            workers=10,                  # Nginx regge bene
+            degradation_factor=0.01,
             description='API Gateway'
         ),
 
         'home-timeline': MicroserviceSpec(
             name='home-timeline',
             dependencies=['post-storage', 'social-graph'],
-            scale_min=2, scale_max=20,
-            execution_time_ms=35.0,       # Aggregazione Redis
-            workers=8,
-            degradation_factor=0.10,      # Degradazione media (CPU bound per deserializzazione JSON)
+            scale_min=1, scale_max=20,
+            execution_time_ms=15.0,      # ← Ridotto da 35ms (Base latency più bassa)
+            workers=2,                   # ← BOTTLE NECK! Solo 2 worker
+            degradation_factor=0.10,
             description='Reads home timeline'
         ),
 
         'user-timeline': MicroserviceSpec(
             name='user-timeline',
             dependencies=['post-storage'],
-            scale_min=2, scale_max=15,
-            execution_time_ms=25.0,       # Più semplice della home
-            workers=8,
+            scale_min=1, scale_max=15,
+            execution_time_ms=10.0,      # ← Ridotto
+            workers=2,                   # ← Bottleneck
             degradation_factor=0.08,
             description='Reads user timeline'
         ),
@@ -75,29 +75,29 @@ class SocialNetworkMicroservices:
         'compose-post': MicroserviceSpec(
             name='compose-post',
             dependencies=['post-storage', 'user-service', 'url-shorten'],
-            scale_min=2, scale_max=15,
-            execution_time_ms=60.0,       # Operazione più pesante (scrittura)
-            workers=4,                    # Pochi worker perché operazioni bloccanti
-            degradation_factor=0.15,      # Alta degradazione (Lock sul DB, coerenza dati)
+            scale_min=1, scale_max=15,
+            execution_time_ms=25.0,      # ← Ridotto da 60ms. Base latency ~40ms totale
+            workers=1,                   # ← CRITICO! 1 solo worker = si intasa subito
+            degradation_factor=0.15,
             description='Creates new posts'
         ),
 
         'post-storage': MicroserviceSpec(
             name='post-storage',
             dependencies=[],
-            scale_min=2, scale_max=12,
-            execution_time_ms=15.0,       # Mongo è veloce sulle singole insert
-            workers=10,
-            degradation_factor=0.05,      # Connection pooling gestisce bene
+            scale_min=1, scale_max=12,
+            execution_time_ms=5.0,       # Mongo veloce
+            workers=4,
+            degradation_factor=0.05,
             description='Post storage (MongoDB)'
         ),
 
         'user-service': MicroserviceSpec(
             name='user-service',
             dependencies=[],
-            scale_min=2, scale_max=8,
-            execution_time_ms=8.0,        # Molto veloce (spesso tutto in cache)
-            workers=10,
+            scale_min=1, scale_max=8,
+            execution_time_ms=3.0,
+            workers=4,
             degradation_factor=0.05,
             description='User info'
         ),
@@ -105,9 +105,9 @@ class SocialNetworkMicroservices:
         'social-graph': MicroserviceSpec(
             name='social-graph',
             dependencies=[],
-            scale_min=2, scale_max=10,
-            execution_time_ms=12.0,       # Redis lookup rapido
-            workers=10,
+            scale_min=1, scale_max=10,
+            execution_time_ms=5.0,
+            workers=4,
             degradation_factor=0.05,
             description='Social graph'
         ),
@@ -116,8 +116,8 @@ class SocialNetworkMicroservices:
             name='url-shorten',
             dependencies=[],
             scale_min=1, scale_max=5,
-            execution_time_ms=5.0,        # Calcolo hash banale
-            workers=10,
+            execution_time_ms=2.0,
+            workers=4,
             degradation_factor=0.02,
             description='URL shortening'
         )

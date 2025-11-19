@@ -21,11 +21,13 @@ from sim.faas import (
     KubernetesResourceConfiguration
 )
 
+from collections import Counter
+
 from topology_testbed_single import SingleNodeTopology
 from social_network_microservices import SocialNetworkMicroservices
 from workload_k6_replica import K6WorkloadGenerator
 from microservice_chain_simulator import MicroserviceSimulatorFactory
-from autoscaler_hybridnew import HybridAutoscaler
+from autoscaler_hybridnew import HybridAutoscaler, AutoscalerConfig
 
 logger = logging.getLogger(__name__)
 
@@ -103,13 +105,28 @@ class SocialNetworkBenchmark(Benchmark):
         yield env.process(env.faas.poll_available_replica('nginx-thrift'))
         logger.info("  ✓ nginx-thrift ready\n")
         
+        # ========== WARM-UP PHASE ==========
+        logger.info("🔥 STARTING WARM-UP (30s @ 50 RPS)...")
+        warmup_end = env.now + 30
+        while env.now < warmup_end:
+            entry_service = 'nginx-thrift'
+            request = FunctionRequest(entry_service)
+            env.process(env.faas.invoke(request))
+            yield env.timeout(1.0 / 50.0)
+            
+        logger.info("✅ Warm-up completed. Starting main workload...")
+        
         # ========== GENERATE REQUESTS ==========
         logger.info("="*70)
         logger.info(f"STARTING WORKLOAD GENERATION ({len(self.requests)} requests)")
         logger.info("="*70 + "\n")
         
         request_count = 0
-        last_log_time = 0
+        last_log_time = env.now
+        last_request_count = 0
+        
+        # ⬅️ NEW: Contatore per le richieste in questo intervallo
+        interval_type_counts = Counter()
         
         for timestamp, endpoint in self.requests:
             # Wait until timestamp
@@ -117,40 +134,75 @@ class SocialNetworkBenchmark(Benchmark):
             if wait_time > 0:
                 yield env.timeout(wait_time)
             
-            # Get call chain for endpoint
+            # Get call chain & Invoke
             call_chain = SocialNetworkMicroservices.get_call_chain(endpoint)
-            
-            # Invoke entry point (nginx-thrift)
             entry_service = call_chain[0]
             request = FunctionRequest(entry_service)
             env.process(env.faas.invoke(request))
             
             request_count += 1
             
+            # ⬅️ NEW: Conta il tipo di richiesta
+            # Abbrevia i nomi per risparmiare spazio nel log
+            short_name = {
+                'homepage': 'home', 
+                'user-timeline': 'u-tl', 
+                'home-timeline': 'h-tl', 
+                'compose-post': 'POST'  # Evidenziamo le scritture!
+            }.get(endpoint, endpoint)
+            
+            interval_type_counts[short_name] += 1
+            
             # Log progress every 60s CON MONITORING
             if env.now - last_log_time >= 60:
+                # 1. Calcoli Metriche Traffico
+                interval_duration = env.now - last_log_time
+                requests_in_interval = request_count - last_request_count
+                current_real_rps = requests_in_interval / interval_duration if interval_duration > 0 else 0
+                
                 progress = (env.now / (self.config.duration_minutes * 60)) * 100
                 
-                # Calcola P95 corrente (ultimi 60s)
+                # 2. Calcolo Orario Simulato
+                cycle_sec = self.config.minutes_per_simulated_day * 60
+                day_progress = (env.now % cycle_sec) / cycle_sec
+                sim_h = int(day_progress * 24)
+                sim_m = int((day_progress * 24 * 60) % 60)
+                sim_time_str = f"{sim_h:02d}:{sim_m:02d}"
+
+                # 3. Calcolo P95
                 current_p95 = self._calculate_current_p95(env)
                 
-                # Conta replicas nginx-thrift RUNNING
-                try:
-                    nginx_replicas = len([r for r in env.faas.get_replicas('nginx-thrift') 
-                                         if hasattr(r, 'state') and r.state.name == 'RUNNING'])
-                except:
-                    nginx_replicas = 1  # Fallback
+                # 4. Conteggio Repliche Compatto
+                deployments = env.faas.get_deployments()
+                shortcuts = {
+                    'nginx-thrift': 'ngx', 'compose-post': 'cmp', 
+                    'post-storage': 'sto', 'home-timeline': 'hom', 'user-timeline': 'usr'
+                }
+                parts = []
+                for dep in deployments:
+                    name = dep.fn.name
+                    if name in shortcuts:
+                        count = len(env.faas.get_replicas(name))
+                        parts.append(f"{shortcuts[name]}={count}")
+                summary_replicas = ", ".join(parts)
                 
+                # ⬅️ NEW: Formatta il breakdown delle richieste
+                # Es: "POST=430, home=1200..."
+                req_breakdown = ", ".join([f"{k}={v}" for k, v in interval_type_counts.most_common()])
+                
+                # ⬇️ LOG COMPLETO CON BREAKDOWN
                 logger.info(
-                    f"  Progress: {progress:>5.1f}% | t={env.now:>6.1f}s | "
-                    f"requests={request_count:>6} | P95={current_p95:>6.1f}ms | "
-                    f"nginx={nginx_replicas} replicas"
+                    f"  {sim_time_str} (t={env.now:>4.0f}s) | "
+                    f"RPS:{current_real_rps:>3.0f} | "
+                    f"P95:{current_p95:>4.0f}ms | "
+                    f"Reqs:[{req_breakdown}] | "    # <--- QUI VEDI COSA ARRIVA
+                    f"Pods:[{summary_replicas}]"
                 )
+                
                 last_log_time = env.now
+                last_request_count = request_count
+                interval_type_counts.clear() # ⬅️ NEW: Resetta per il prossimo minuto
         
-        logger.info(f"\n✅ Request generation completed at t={env.now:.1f}s")
-        logger.info(f"   Total requests sent: {request_count}")
-    
     def _calculate_current_p95(self, env: Environment) -> float:
         """Calcola P95 response time negli ultimi 60s"""
         try:
@@ -281,20 +333,27 @@ class TestbedReplicaSimulation:
         sim.env.simulator_factory = MicroserviceSimulatorFactory()
         logger.info("  ✓ Microservice chain simulator registered")
         
-        # Setup autoscaler (se enabled)
         if self.enable_autoscaling:
             logger.info("\n🤖 Setting up autoscaler...")
+            
+            # 1. Crea la configurazione con i parametri ottimizzati
+            scaler_config = AutoscalerConfig(
+                check_interval=5.0,           # Controllo frequente (5s)
+                cooldown_period=15.0,         # Scale UP veloce (15s)
+                scale_down_cooldown=60.0,     # Scale DOWN lento (60s)
+                latency_p95_scale_down_ms=45.0, # Soglia P95 per scale down
+                rps_per_replica_target=40.0,  # Target 40 RPS (più realistico)
+                enable_proactive=False        # Solo reactive per ora
+            )
+            
+            # 2. Istanzia l'autoscaler passando il config
             autoscaler = HybridAutoscaler(
                 sim.env,
-                check_interval=10.0,  # Check ogni 10s
-                cooldown_period=50.0,  # Cooldown 50s (come testbed)
-                enable_proactive=False  # Solo reactive per ora
+                config=scaler_config
             )
+            
             sim.env.process(autoscaler.run())
             logger.info("  ✓ Autoscaler registered as background process")
-        else:
-            logger.info("\n⚠️  Autoscaling DISABLED")
-            logger.info("    Running with fixed replicas (scale_min)\n")
         
         # ========== RUN ==========
         logger.info("\n" + "="*70)
@@ -441,6 +500,13 @@ def main():
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%H:%M:%S'
     )
+    
+    logging.getLogger('sim.faas.system').setLevel(logging.WARNING)
+    logging.getLogger('microservice_chain_simulator').setLevel(logging.WARNING)
+    logging.getLogger('autoscaler_hybridnew').setLevel(logging.WARNING)
+    logging.getLogger('sim.faassim').setLevel(logging.WARNING)
+    logging.getLogger('topology_testbed_single').setLevel(logging.WARNING)
+    logging.getLogger('workload_k6_replica').setLevel(logging.WARNING)
     
     # Run simulation
     sim = TestbedReplicaSimulation(

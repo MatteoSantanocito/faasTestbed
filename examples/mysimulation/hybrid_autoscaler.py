@@ -19,15 +19,15 @@ logger = logging.getLogger(__name__)
 class AutoscalerConfig:
     """Configurazione autoscaler"""
     # Parametri reattivi
-    latency_p95_threshold_ms: float = 90.0      # Soglia P95 latenza (ms)
+    latency_p95_threshold_ms: float = 100.0     # Alzato leggermente per tolleranza
     latency_p95_scale_down_ms: float = 30.0     # Soglia scale-down
-    rps_per_replica_target: float = 10.0        # Target RPS per replica
+    rps_per_replica_target: float = 40.0        # Alzato da 10 a 40 (più realistico)
     error_rate_threshold: float = 0.01          # 1% error rate
     
     # Parametri temporali
-    check_interval: float = 10.0                # Ogni quanto controlla (s)
-    cooldown_period: float = 50.0               # Cooldown tra scaling (s)
-    scale_down_cooldown: float = 120.0          # Cooldown più lungo per scale-down
+    check_interval: float = 5.0                 # Controllo più frequente (ogni 5s invece di 10s)
+    cooldown_period: float = 15.0               # Scale UP rapido (era 50s)
+    scale_down_cooldown: float = 60.0           # Scale DOWN lento per stabilità
     
     # Parametri predittivi (per futuro ML)
     enable_proactive: bool = False
@@ -72,7 +72,8 @@ class HybridAutoscaler:
         mode = "HYBRID (reactive + proactive)" if self.config.enable_proactive else "REACTIVE only"
         logger.info(f"🤖 HybridAutoscaler initialized in {mode} mode")
         logger.info(f"   Thresholds: P95={self.config.latency_p95_threshold_ms}ms, "
-                   f"RPS/replica={self.config.rps_per_replica_target}")
+                    f"RPS/replica={self.config.rps_per_replica_target}")
+        logger.info(f"   Cooldown: UP={self.config.cooldown_period}s, DOWN={self.config.scale_down_cooldown}s")
     
     def run(self):
         """Background process che monitora e scala"""
@@ -178,71 +179,77 @@ class HybridAutoscaler:
     def _make_scaling_decision(self, fn_name: str, metrics: Dict, deployment) -> Dict:
         """
         Combina logica reattiva e proattiva per decidere scaling
-        
-        Returns:
-            Dict con: action ('scale_up'/'scale_down'/'none'), count, reason
         """
         current_replicas = metrics['replicas']
         
-        # ========== CHECK COOLDOWN ==========
-        if self._in_cooldown(fn_name):
-            return {'action': 'none', 'count': 0, 'reason': 'cooldown'}
+        # ========== CHECK COOLDOWN GENERICO (SOLO PER SCALE UP) ==========
+        # Nota: Per lo scale DOWN controlliamo un timer separato più sotto
+        in_up_cooldown = self._in_cooldown(fn_name)
         
         # ========== COMPONENTE PROATTIVA (se abilitata) ==========
         if self.config.enable_proactive:
-            proactive_decision = self._evaluate_proactive(fn_name, metrics, deployment)
-            if proactive_decision['action'] != 'none':
-                return proactive_decision
+            if not in_up_cooldown:
+                proactive_decision = self._evaluate_proactive(fn_name, metrics, deployment)
+                if proactive_decision['action'] != 'none':
+                    return proactive_decision
         
         # ========== COMPONENTE REATTIVA ==========
         
-        # 🔼 SCALE UP: Latenza alta
-        if metrics['p95_latency_ms'] > self.config.latency_p95_threshold_ms:
-            # Scala aggressivamente se latenza molto alta
-            if metrics['p95_latency_ms'] > self.config.latency_p95_threshold_ms * 1.5:
-                count = 2
-                reason = f"P95={metrics['p95_latency_ms']:.1f}ms >> threshold (critical)"
-            else:
-                count = 1
-                reason = f"P95={metrics['p95_latency_ms']:.1f}ms > threshold"
+        # 1. CONTROLLI DI SCALE UP (Se non siamo in cooldown rapido)
+        if not in_up_cooldown:
             
-            required = min(current_replicas + count, deployment.scaling_config.scale_max)
-            return {
-                'action': 'scale_up',
-                'count': required - current_replicas,
-                'reason': reason
-            }
-        
-        # 🔼 SCALE UP: RPS troppo alto per replica
-        target_rps = self.config.rps_per_replica_target
-        if metrics['rps_per_replica'] > target_rps * 1.5:
-            # Calcola repliche necessarie
-            required = int((metrics['rps'] / target_rps) + 0.99)
-            required = min(required, deployment.scaling_config.scale_max)
-            required = max(required, deployment.scaling_config.scale_min)
-            
-            if required > current_replicas:
+            # A. Latenza alta
+            if metrics['p95_latency_ms'] > self.config.latency_p95_threshold_ms:
+                # Scala aggressivamente se latenza molto alta
+                if metrics['p95_latency_ms'] > self.config.latency_p95_threshold_ms * 1.5:
+                    count = 2
+                    reason = f"P95={metrics['p95_latency_ms']:.1f}ms >> threshold (critical)"
+                else:
+                    count = 1
+                    reason = f"P95={metrics['p95_latency_ms']:.1f}ms > threshold"
+                
+                required = min(current_replicas + count, deployment.scaling_config.scale_max)
                 return {
                     'action': 'scale_up',
                     'count': required - current_replicas,
-                    'reason': f"RPS/replica={metrics['rps_per_replica']:.1f} > target"
+                    'reason': reason
+                }
+            
+            # B. RPS troppo alto per replica
+            target_rps = self.config.rps_per_replica_target
+            
+            # FIX: Nginx regge molto più carico!
+            if fn_name == 'nginx-thrift':
+                 target_rps = 200.0  # Target specifico per Gateway
+            
+            if metrics['rps_per_replica'] > target_rps * 1.5:
+                # Calcola repliche necessarie
+                required = int((metrics['rps'] / target_rps) + 0.99)
+                required = min(required, deployment.scaling_config.scale_max)
+                required = max(required, deployment.scaling_config.scale_min)
+                
+                if required > current_replicas:
+                    return {
+                        'action': 'scale_up',
+                        'count': required - current_replicas,
+                        'reason': f"RPS/replica={metrics['rps_per_replica']:.1f} > target ({target_rps})"
+                    }
+            
+            # C. Code lunghe
+            if metrics['avg_queue_time'] > 1.0:  # Abbassato a 1s per reattività
+                return {
+                    'action': 'scale_up',
+                    'count': 1,
+                    'reason': f"High queue time={metrics['avg_queue_time']:.2f}s"
                 }
         
-        # 🔼 SCALE UP: Code lunghe
-        if metrics['avg_queue_time'] > 2.0:  # >2s di attesa in coda
-            return {
-                'action': 'scale_up',
-                'count': 1,
-                'reason': f"High queue time={metrics['avg_queue_time']:.2f}s"
-            }
-        
-        # 🔽 SCALE DOWN: Sotto-utilizzo prolungato
-        # Richiede conferma su multiple osservazioni
+        # 2. CONTROLLI DI SCALE DOWN
+        # Richiede conferma su multiple osservazioni e cooldown specifico LUNGO
         if self._should_scale_down(fn_name, metrics, deployment):
             return {
                 'action': 'scale_down',
                 'count': 1,
-                'reason': f"Low utilization: P95={metrics['p95_latency_ms']:.1f}ms, RPS/rep={metrics['rps_per_replica']:.1f}"
+                'reason': f"Low utilization: P95={metrics['p95_latency_ms']:.1f}ms"
             }
         
         return {'action': 'none', 'count': 0, 'reason': 'stable'}
@@ -250,52 +257,38 @@ class HybridAutoscaler:
     def _evaluate_proactive(self, fn_name: str, metrics: Dict, deployment) -> Dict:
         """
         Valuta decisioni proattive basate su ML predictions
-        (Placeholder per futuro ML integration)
         """
-        # Questo è un placeholder per future estensioni con ML
-        # Nel sistema del collega, qui verrebbe letto il file JSON con predizioni
-        
-        # Esempio di come potrebbe funzionare:
-        # prediction = self.ml_predictions.get(fn_name, {})
-        # confidence = prediction.get('spike_probability', 0.0)
-        #
-        # if confidence > self.config.confidence_threshold_urgent:
-        #     return {'action': 'scale_up', 'count': 2, 'reason': f'ML: spike predicted (conf={confidence:.2f})'}
-        # elif confidence > self.config.confidence_threshold_elevated:
-        #     return {'action': 'scale_up', 'count': 1, 'reason': f'ML: elevated risk (conf={confidence:.2f})'}
-        
         return {'action': 'none', 'count': 0, 'reason': 'proactive: no action'}
     
     def _should_scale_down(self, fn_name: str, metrics: Dict, deployment) -> bool:
         """
         Decide se scalare in basso basandosi su trend sostenuto
         """
-        # Condizioni per scale-down:
-        # 1. Latenza bassa
-        # 2. RPS basso
-        # 3. Nessuna coda
-        # 4. Trend confermato su multiple osservazioni
-        
         if metrics['replicas'] <= deployment.scaling_config.scale_min:
             return False
         
+        # 1. Check Metriche Istantanee
         if metrics['p95_latency_ms'] > self.config.latency_p95_scale_down_ms:
             return False
         
-        if metrics['avg_queue_time'] > 0.1:
+        if metrics['avg_queue_time'] > 0.05: # Quasi zero coda
             return False
         
         target_rps = self.config.rps_per_replica_target
-        if metrics['rps_per_replica'] > target_rps * 0.3:  # Almeno 30% utilizzo
+        # Fix anche qui per nginx
+        if fn_name == 'nginx-thrift':
+            target_rps = 200.0
+
+        if metrics['rps_per_replica'] > target_rps * 0.4:  # Almeno 40% utilizzo
             return False
         
-        # Controlla cooldown specifico per scale-down
+        # 2. Check Cooldown LUNGO specifico per Scale Down
         if fn_name in self.last_scale_time:
             time_since = self.env.now - self.last_scale_time[fn_name]
             if time_since < self.config.scale_down_cooldown:
                 return False
         
-        # Conferma trend su ultime N osservazioni
+        # 3. Conferma trend su ultime N osservazioni
         history = self.observation_history.get(fn_name, [])
         if len(history) < self.config.min_observations_for_scale_down:
             return False
@@ -303,7 +296,7 @@ class HybridAutoscaler:
         recent = history[-self.config.min_observations_for_scale_down:]
         all_low = all(
             obs['p95_latency_ms'] < self.config.latency_p95_scale_down_ms and
-            obs['rps_per_replica'] < target_rps * 0.3
+            obs['rps_per_replica'] < target_rps * 0.4
             for obs in recent
         )
         
@@ -335,7 +328,6 @@ class HybridAutoscaler:
             window = min(100, len(fn_df))
             recent = fn_df.tail(window)
             
-            # Response time = t_wait + t_exec (se disponibili)
             if 't_wait' in recent.columns and 't_exec' in recent.columns:
                 response_times = recent['t_wait'] + recent['t_exec']
             elif 't_exec' in recent.columns:
@@ -370,7 +362,7 @@ class HybridAutoscaler:
             return 0.0
     
     def _in_cooldown(self, fn_name: str) -> bool:
-        """Check se in cooldown"""
+        """Check se in cooldown (usa il periodo BREVE per lo scale up)"""
         if fn_name not in self.last_scale_time:
             return False
         time_since = self.env.now - self.last_scale_time[fn_name]
@@ -405,12 +397,5 @@ class HybridAutoscaler:
         self.last_scale_time[fn_name] = self.env.now
     
     def set_ml_prediction(self, fn_name: str, prediction: Dict):
-        """
-        Imposta predizione ML per una funzione
-        (Per futuro uso con modelli ML)
-        
-        Args:
-            fn_name: Nome funzione
-            prediction: Dict con 'spike_probability', 'confidence', etc.
-        """
+        """Imposta predizione ML"""
         self.ml_predictions[fn_name] = prediction
