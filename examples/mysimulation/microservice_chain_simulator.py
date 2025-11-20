@@ -48,13 +48,40 @@ class MicroserviceChainSimulator(FunctionSimulator):
         # Ottieni dipendenze dal catalogo
         self.dependencies = SocialNetworkMicroservices.get_dependencies(service_name)
     
+    def deploy(self, env: Environment, replica: FunctionReplica):
+        """Deploy phase: image pull"""
+        # Simula docker pull (se immagine non in cache)
+        import sim.docker as docker
+        yield from docker.pull(env, replica.container.image, replica.node.ether_node)
+
+    def startup(self, env: Environment, replica: FunctionReplica):
+        """Startup phase: container initialization"""
+        # Tempo realistico: 3-8 secondi (misurato nel testbed)
+        import random
+        startup_delay = random.uniform(3.0, 8.0)
+        
+        logger.info(
+            f"[t={env.now:.1f}s] Starting {self.service_name} "
+            f"on {replica.node.name} (startup_delay={startup_delay:.1f}s)"
+        )
+        
+        yield env.timeout(startup_delay)
+
     def setup(self, env: Environment, replica: FunctionReplica):
-        """Setup del simulator (richiesto da FunctionSimulator)"""
+        """Setup phase: runtime initialization"""
         import simpy
-        # Crea coda workers
         self.queue = simpy.Resource(env, capacity=self.workers)
-        logger.info(f"Setup {self.service_name}: {self.workers} workers")
-        yield env.timeout(0.001)
+        
+        # Runtime setup (più veloce: 0.5-2s)
+        import random
+        setup_delay = random.uniform(0.5, 2.0)
+        
+        logger.info(
+            f"[t={env.now:.1f}s] Setup {self.service_name}: "
+            f"{self.workers} workers (setup_delay={setup_delay:.1f}s)"
+        )
+        
+        yield env.timeout(setup_delay)
     
     def invoke(self, env: Environment, replica: FunctionReplica, request: FunctionRequest):
         """
@@ -83,12 +110,14 @@ class MicroserviceChainSimulator(FunctionSimulator):
         # ========== 4. ESECUZIONE ==========
         yield env.timeout(exec_time)
         
-        # ========== 5. RILASCIA WORKER ==========
-        self.queue.release(worker_request)
         
-        # ========== 6. INVOCAZIONI DIPENDENZE ==========
+        
+        # ========== 5. INVOCAZIONI DIPENDENZE ==========
         if self.dependencies:
             yield from self._invoke_dependencies(env, request)
+            
+        # ========== 6. RILASCIA WORKER ==========
+        self.queue.release(worker_request)
         
         # ========== 7. RILASCIA RISORSE ==========
         env.resource_state.remove_resource(replica, 'cpu', 0.25)

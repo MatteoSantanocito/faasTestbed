@@ -7,6 +7,7 @@ import logging
 import argparse
 import sys
 import os
+import random
 
 # Add paths
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -107,15 +108,47 @@ class SocialNetworkBenchmark(Benchmark):
         
         # ========== WARM-UP PHASE ==========
         logger.info("🔥 STARTING WARM-UP (30s @ 50 RPS)...")
-        warmup_end = env.now + 30
-        while env.now < warmup_end:
-            entry_service = 'nginx-thrift'
-            request = FunctionRequest(entry_service)
-            env.process(env.faas.invoke(request))
-            yield env.timeout(1.0 / 50.0)
-            
-        logger.info("✅ Warm-up completed. Starting main workload...")
         
+        # STEP 1: Aspetta che TUTTI i servizi abbiano almeno 1 replica
+        logger.info("   Step 1: Waiting for all services to be ready...")
+        all_services = [
+            'nginx-thrift', 'home-timeline', 'user-timeline', 'compose-post',
+            'post-storage', 'user-service', 'social-graph', 
+            'text-service', 'media-service', 'unique-id-service',  
+            'user-mention-service', 'url-shorten-service', 'write-home-timeline'  
+        ]
+        
+        for service_name in all_services:
+            yield env.process(env.faas.poll_available_replica(service_name))
+            logger.info(f"     ✓ {service_name} ready")
+        
+        logger.info("   Step 2: All services ready! Starting warm-up traffic...\n")
+        
+        # STEP 2: Warm-up PROGRESSIVO (come nel testbed reale)
+        warmup_counter = 0
+        warmup_start = env.now
+
+        logger.info("   [0-60s] Progressive warm-up (50→150 RPS)...")
+
+        # Fase 1: Warm-up gentile (30s @ 50 RPS)
+        phase1_end = warmup_start + 30
+        while env.now < phase1_end:
+            request = FunctionRequest('nginx-thrift')
+            env.process(env.faas.invoke(request))
+            warmup_counter += 1
+            yield env.timeout(1.0 / 50.0)
+
+        # Fase 2: Ramp-up (30s @ 150 RPS) - simula inizio traffico reale
+        phase2_end = warmup_start + 60
+        while env.now < phase2_end:
+            request = FunctionRequest('nginx-thrift')
+            env.process(env.faas.invoke(request))
+            warmup_counter += 1
+            yield env.timeout(1.0 / 150.0)  # 150 RPS
+
+        logger.info(f"✅ Warm-up completed ({warmup_counter} requests)")
+        logger.info(f"   System pre-scaled to handle {150} RPS\n")
+                
         # ========== GENERATE REQUESTS ==========
         logger.info("="*70)
         logger.info(f"STARTING WORKLOAD GENERATION ({len(self.requests)} requests)")
@@ -135,14 +168,16 @@ class SocialNetworkBenchmark(Benchmark):
                 yield env.timeout(wait_time)
             
             # Get call chain & Invoke
-            call_chain = SocialNetworkMicroservices.get_call_chain(endpoint)
-            entry_service = call_chain[0]
+            if endpoint == 'homepage':
+                entry_service = 'nginx-thrift'
+            else:
+                entry_service = endpoint  # 'user-timeline', 'home-timeline', 'compose-post'
             request = FunctionRequest(entry_service)
             env.process(env.faas.invoke(request))
             
             request_count += 1
             
-            # ⬅️ NEW: Conta il tipo di richiesta
+            # Conta il tipo di richiesta
             # Abbrevia i nomi per risparmiare spazio nel log
             short_name = {
                 'homepage': 'home', 
